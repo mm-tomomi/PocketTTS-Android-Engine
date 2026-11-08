@@ -2115,6 +2115,31 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
         });
         
         bool first = true;
+
+        // Fade each chunk in and out so the decoder's background noise does not
+        // start and stop abruptly (audible as a pop between sentences).
+        const size_t fade_in_n = static_cast<size_t>(SR) * 10 / 1000;   // 10 ms
+        const size_t fade_out_n = static_cast<size_t>(SR) * 30 / 1000;  // 30 ms
+        constexpr float kPi = 3.14159265358979f;
+        std::vector<float> pend;  // samples not yet sent; last fade_out_n held back
+        size_t pos = 0;           // samples of this chunk already sent
+        auto emit = [&](const float* v, size_t n, bool last) -> bool {
+            const size_t start = pend.size();
+            if (n) pend.insert(pend.end(), v, v + n);
+            for (size_t i = start; i < pend.size() && pos + i < fade_in_n; ++i)
+                pend[i] *= 0.5f - 0.5f * std::cos(kPi * (pos + i + 0.5f) / fade_in_n);
+            size_t keep = std::min(fade_out_n, pend.size());
+            if (last) {
+                for (size_t k = 0; k < keep; ++k)
+                    pend[pend.size() - keep + k] *= 0.5f + 0.5f * std::cos(kPi * (k + 0.5f) / keep);
+                keep = 0;
+            }
+            const size_t out = pend.size() - keep;
+            const bool ok = out == 0 || cb(pend.data(), out);
+            pend.erase(pend.begin(), pend.begin() + out);
+            pos += out;
+            return ok;
+        };
         
         while (true) {
             int want = first ? cfg_.first_chunk_frames : cfg_.max_chunk_frames;
@@ -2145,7 +2170,7 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
                 size_t n = 1;
                 for (auto d : shape) n *= d;
                 
-                if (!cb(outputs[0].GetTensorData<float>(), n)) {
+                if (!emit(outputs[0].GetTensorData<float>(), n, false)) {
                     std::lock_guard<std::mutex> lock(mtx);
                     aborted = true;
                     break;
@@ -2158,6 +2183,7 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
             gen_thread.join();
         }
         if (aborted) return;
+        if (!emit(nullptr, 0, true)) return;
         if (chunks[si].sentence_end && !silence.empty() && !cb(silence.data(), silence.size())) return;
     }
 }
